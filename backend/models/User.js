@@ -67,6 +67,13 @@ otpExpire: { type: Date },
     default: 'available'
   },
   govtIdUrl: { type: String, default: '' },
+  aadhaarCardUrl: { type: String, default: '' },
+  aadhaarNumber: { type: String, default: '' },
+  kycDocumentType: {
+    type: String,
+    enum: ['none', 'aadhaar'],
+    default: 'none'
+  },
   organizationName: { type: String, default: '' },
   photo: { type: String, default: '' },
   city: { type: String, default: '' },
@@ -146,6 +153,12 @@ otpExpire: { type: Date },
 });
 
 UserSchema.index({ location: '2dsphere' });
+
+UserSchema.pre('validate', function normalizeLegacyRole() {
+  if (this.role) {
+    this.role = normalizeRole(this.role);
+  }
+});
 
 // Age calculation logic remains the same
 UserSchema.virtual('age').get(function() {

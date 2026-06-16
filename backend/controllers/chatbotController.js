@@ -10,7 +10,7 @@ const intents = [
   },
   {
     name: 'project_overview',
-    keywords: ['project', 'resource network', 'system', 'platform', 'overview', 'purpose', 'what is this']
+    keywords: ['project', 'resource network', 'donation bridge', 'system', 'platform', 'overview', 'purpose', 'what is this']
   },
   {
     name: 'donor',
@@ -94,10 +94,10 @@ const buildReply = async (message) => {
 
   switch (intent) {
     case 'greeting':
-      return `Hello. Resource Network currently tracks ${context.totalDonations} donations, ${context.openRequests} open NGO requests, and ${context.activeDeliveries} active deliveries. Ask me about donor posting, NGO claims, delivery proof, maps, or analytics.`;
+      return `Hello. Donation Bridge currently tracks ${context.totalDonations} donations, ${context.openRequests} open NGO requests, and ${context.activeDeliveries} active deliveries. Ask me about donor posting, NGO claims, delivery proof, maps, or analytics.`;
 
     case 'project_overview':
-      return `Resource Network is a MERN-based resource donation platform with four roles: donor, NGO, delivery partner, and super admin. Donors post resources, NGOs claim nearby items and broadcast urgent needs, delivery partners handle pickup and proof of delivery, and admins manage KYC, risk monitoring, heatmaps, and PDF reporting.`;
+      return `Donation Bridge is a MERN-based resource donation platform with four roles: donor, NGO, delivery partner, and super admin. Donors post resources, NGOs claim nearby items and broadcast urgent needs, delivery partners handle pickup and proof of delivery, and admins manage KYC, risk monitoring, heatmaps, and PDF reporting.`;
 
     case 'donor':
       return `The donor dashboard supports a smart donation wizard, OCR-assisted medicine validation, food freshness timing, a Google Map pickup selector, live donation history, and a rewards area for impact points and coupon-style milestones. Donor history and rewards are both live sections now, not placeholder tabs.`;
@@ -130,7 +130,7 @@ const buildReply = async (message) => {
       if (query.includes('how') && query.includes('work')) {
         return 'The workflow is donor posts a resource, NGO claims it, delivery partner accepts the logistics task, pickup and drop proof are uploaded, and admin can audit the full chain through logs, analytics, and monitoring screens.';
       }
-      return `I did not detect a narrow topic in that question, so here is the short summary: Resource Network connects ${context.donorCount} donors, ${context.ngoCount} NGOs, and ${context.deliveryCount} delivery partners through verified donation posting, nearby claiming, delivery proof, maps, and admin reporting.`;
+      return `I did not detect a narrow topic in that question, so here is the short summary: Donation Bridge connects ${context.donorCount} donors, ${context.ngoCount} NGOs, and ${context.deliveryCount} delivery partners through verified donation posting, nearby claiming, delivery proof, maps, and admin reporting.`;
   }
 };
 

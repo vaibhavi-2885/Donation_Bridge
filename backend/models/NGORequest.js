@@ -40,13 +40,22 @@ const NGORequestSchema = new mongoose.Schema({
     },
     coordinates: {
       type: [Number],
-      default: [77.1025, 28.7041]
+      default: [75.7139, 19.7515]
     }
+  },
+  deliveryAddress: {
+    type: String,
+    default: ''
   },
   status: {
     type: String,
-    enum: ['Open', 'Fulfilled', 'Closed'],
+    enum: ['Open', 'Matched', 'Fulfilled', 'Closed'],
     default: 'Open'
+  },
+  adminReviewStatus: {
+    type: String,
+    enum: ['Pending', 'Under Review', 'Matched', 'Approved', 'Closed'],
+    default: 'Pending'
   },
   matchedDonations: {
     type: [{
@@ -54,6 +63,20 @@ const NGORequestSchema = new mongoose.Schema({
       ref: 'Donation'
     }],
     default: []
+  },
+  assignedDonation: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Donation',
+    default: null
+  },
+  assignedByAdmin: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null
+  },
+  adminNotes: {
+    type: String,
+    default: ''
   },
   fulfillmentStatus: {
     type: String,

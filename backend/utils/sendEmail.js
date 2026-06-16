@@ -13,7 +13,7 @@ const sendEmail = async (options) => {
 
     // 2. Define Mail Options
     const mailOptions = {
-        from: `"Resource Network" <${process.env.EMAIL_USER}>`,
+        from: `"Donation Bridge" <${process.env.EMAIL_USER}>`,
         to: options.email,
         subject: options.subject,
         text: options.message,

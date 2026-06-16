@@ -8,7 +8,13 @@ const { logActivity } = require('../utils/activityLogger');
 const { createNotification } = require('../utils/notify');
 const { recommendPartners } = require('../utils/matchingEngine');
 
-const DEFAULT_COORDINATES = [77.1025, 28.7041];
+const DEFAULT_COORDINATES = [75.7139, 19.7515];
+const MAHARASHTRA_BOUNDS = {
+    minLat: 15.6,
+    maxLat: 22.1,
+    minLng: 72.6,
+    maxLng: 80.9
+};
 
 const emitDonationUpdate = async (req, donation, message) => {
     const io = req.app.get('socketio');
@@ -18,21 +24,24 @@ const emitDonationUpdate = async (req, donation, message) => {
 
     const populatedDonation = await Donation.findById(donation._id)
         .populate('donor', 'name email mobile role photo')
-        .populate('claimedBy', 'name email mobile role')
-        .populate('assignedPartner', 'name email mobile role photo');
+        .populate('claimedBy', 'name email mobile role organizationName address location')
+        .populate('assignedPartner', 'name email mobile role photo vehicleType location')
+        .populate('matchedRequest', 'title category quantityNeeded unit urgency deliveryAddress location');
 
-    [populatedDonation.donor?._id, populatedDonation.claimedBy?._id, populatedDonation.assignedPartner?._id]
+    const trackedDonation = attachLiveTracking(populatedDonation?.toObject ? populatedDonation.toObject() : populatedDonation);
+
+    [trackedDonation?.donor?._id, trackedDonation?.claimedBy?._id, trackedDonation?.assignedPartner?._id]
         .filter(Boolean)
         .forEach((userId) => {
             io.to(String(userId)).emit('donation_status_update', {
                 message,
-                donation: populatedDonation
+                donation: trackedDonation
             });
         });
 
     io.emit('admin_activity', {
         message,
-        donation: populatedDonation
+        donation: trackedDonation
     });
 };
 
@@ -96,6 +105,186 @@ const isWithinPartnerSchedule = (user) => {
     return true;
 };
 
+const isWithinMaharashtra = (coordinates = []) => {
+    if (!Array.isArray(coordinates) || coordinates.length !== 2) return false;
+    const [lng, lat] = coordinates;
+    return lat >= MAHARASHTRA_BOUNDS.minLat &&
+        lat <= MAHARASHTRA_BOUNDS.maxLat &&
+        lng >= MAHARASHTRA_BOUNDS.minLng &&
+        lng <= MAHARASHTRA_BOUNDS.maxLng;
+};
+
+const looksLikeRealAddress = (value = '') => {
+    const normalized = String(value).trim();
+    return normalized.length >= 12 &&
+        /\d/.test(normalized) &&
+        /[a-zA-Z]/.test(normalized) &&
+        /,/.test(normalized);
+};
+
+const extractPincode = (value = '') => {
+    const match = String(value).match(/\b\d{6}\b/);
+    return match ? match[0] : '';
+};
+
+const extractCityLike = (value = '') => {
+    const lower = String(value).toLowerCase();
+    if (lower.includes('dhule')) return 'dhule';
+    if (lower.includes('nashik')) return 'nashik';
+    if (lower.includes('pune')) return 'pune';
+    if (lower.includes('mumbai')) return 'mumbai';
+    if (lower.includes('nagpur')) return 'nagpur';
+    return '';
+};
+
+const deriveAddressDistanceKm = (addressA = '', addressB = '', computedDistanceKm = null) => {
+    const pinA = extractPincode(addressA);
+    const pinB = extractPincode(addressB);
+    const cityA = extractCityLike(addressA);
+    const cityB = extractCityLike(addressB);
+
+    if (pinA && pinB && pinA === pinB && (computedDistanceKm === null || computedDistanceKm > 20)) {
+        return 2.5;
+    }
+
+    if (cityA && cityB && cityA === cityB && (computedDistanceKm === null || computedDistanceKm > 30)) {
+        return 6;
+    }
+
+    return computedDistanceKm;
+};
+
+const interpolatePoint = (start = [], end = [], progress = 0) => {
+    if (start.length !== 2 || end.length !== 2) return [];
+    const [startLng, startLat] = start;
+    const [endLng, endLat] = end;
+    return [
+        Number((startLng + (endLng - startLng) * progress).toFixed(6)),
+        Number((startLat + (endLat - startLat) * progress).toFixed(6))
+    ];
+};
+
+const getTrackingProgress = (status) => {
+    if (status === 'Assigned') return 0.12;
+    if (status === 'Picked Up') return 0.35;
+    if (status === 'In Transit') return 0.7;
+    if (status === 'Delivered') return 1;
+    return 0;
+};
+
+const attachLiveTracking = (donationLike) => {
+    if (!donationLike) return donationLike;
+    const pickupCoordinates = donationLike.location?.coordinates || [];
+    const dropCoordinates = donationLike.matchedRequest?.location?.coordinates ||
+        donationLike.claimedBy?.location?.coordinates || [];
+    const progress = getTrackingProgress(donationLike.status);
+    const liveCoordinates = interpolatePoint(pickupCoordinates, dropCoordinates, progress);
+    return {
+        ...donationLike,
+        liveTracking: {
+            progress,
+            pickupCoordinates,
+            dropCoordinates,
+            currentCoordinates: liveCoordinates,
+            deliveryAddress: donationLike.matchedRequest?.deliveryAddress ||
+                donationLike.claimedBy?.address ||
+                ''
+        }
+    };
+};
+
+const getDistanceKm = (pointA = [], pointB = []) => {
+    if (pointA.length !== 2 || pointB.length !== 2) return null;
+    const toRadians = (degrees) => (degrees * Math.PI) / 180;
+    const [lng1, lat1] = pointA;
+    const [lng2, lat2] = pointB;
+    const earthRadiusKm = 6371;
+    const dLat = toRadians(lat2 - lat1);
+    const dLng = toRadians(lng2 - lng1);
+    const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLng / 2) ** 2;
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Number((earthRadiusKm * c).toFixed(1));
+};
+
+const buildAssignmentForRequest = async ({ req, donation, ngoRequest, actorName, actorId }) => {
+    donation.claimedBy = ngoRequest.ngo;
+    donation.matchedRequest = ngoRequest._id;
+    donation.adminManaged = true;
+    donation.status = 'Claimed';
+
+    const ngo = await User.findById(ngoRequest.ngo);
+    const config = await getSystemConfig();
+    const partnerPool = await User.find({ role: 'delivery_partner', isBlocked: false });
+    const recommendations = await recommendPartners({ donation, partners: partnerPool, config });
+    const bestPartner = recommendations.find((item) => item.eligible)?.partner || null;
+
+    if (bestPartner) {
+        donation.assignedPartner = bestPartner._id;
+        donation.status = 'Assigned';
+    }
+
+    await donation.save();
+
+    ngoRequest.matchedDonations = Array.from(new Set([
+        ...ngoRequest.matchedDonations.map((item) => String(item)),
+        String(donation._id)
+    ]));
+    ngoRequest.assignedDonation = donation._id;
+    ngoRequest.assignedByAdmin = actorId || null;
+    ngoRequest.adminReviewStatus = bestPartner ? 'Approved' : 'Matched';
+    ngoRequest.fulfillmentStatus = 'Matched';
+    ngoRequest.status = bestPartner ? 'Matched' : 'Open';
+    await ngoRequest.save();
+
+    const deliveryRun = await DeliveryRun.findOneAndUpdate(
+        { donation: donation._id },
+        {
+            donation: donation._id,
+            donor: donation.donor,
+            ngo: ngoRequest.ngo,
+            ngoRequest: ngoRequest._id,
+            partner: bestPartner?._id || null,
+            status: bestPartner ? 'Assigned' : 'Scheduled',
+            pickupWindowStart: donation.pickupWindowStart || null,
+            pickupWindowEnd: donation.pickupWindowEnd || null,
+            $push: {
+                interventionNotes: {
+                    note: `Donation matched to NGO request by ${actorName || 'Admin'}.`,
+                    createdBy: actorName || 'Admin'
+                }
+            }
+        },
+        { upsert: true, new: true }
+    );
+
+    await createNotification(req, {
+        users: [donation.donor, ngoRequest.ngo, bestPartner?._id].filter(Boolean),
+        title: 'Admin Fulfillment Match Created',
+        message: `${donation.item} has been matched to an NGO request through the admin orchestration workflow.`,
+        type: 'assignment',
+        severity: 'warning',
+        channels: ['in_app', 'email'],
+        link: bestPartner ? '/delivery-dashboard?view=tasks' : '/ngo-dashboard?view=requests'
+    });
+
+    await emitDonationUpdate(req, donation, 'Admin matched a donor resource to an NGO need.');
+
+    return {
+        deliveryRun,
+        recommendations: recommendations.slice(0, 5).map((item) => ({
+            partnerId: item.partner._id,
+            name: item.partner.name,
+            vehicleType: item.partner.vehicleType,
+            distanceKm: item.distanceKm,
+            capacityLeft: item.capacityLeft,
+            score: item.score,
+            eligible: item.eligible
+        }))
+    };
+};
+
 exports.createDonation = async (req, res) => {
     try {
         const {
@@ -113,11 +302,16 @@ exports.createDonation = async (req, res) => {
             extractedText,
             pickupWindowStart,
             pickupWindowEnd,
-            vehiclePreference
+            vehiclePreference,
+            qualityAssessment
         } = req.body;
 
         if (!item || !category || !image) {
             return res.status(400).json({ success: false, message: 'Item, category, and image are required.' });
+        }
+
+        if (!looksLikeRealAddress(address)) {
+            return res.status(400).json({ success: false, message: 'Please select a valid pickup address from the map or address search.' });
         }
 
         if (category === 'Medicine' && Boolean(req.body.isExpired)) {
@@ -126,6 +320,12 @@ exports.createDonation = async (req, res) => {
 
         const config = await getSystemConfig();
         const locationCoordinates = Array.isArray(coordinates) && coordinates.length === 2 ? coordinates : DEFAULT_COORDINATES;
+        if (!isWithinMaharashtra(locationCoordinates)) {
+            return res.status(400).json({ success: false, message: 'Resource Network currently supports verified addresses within Maharashtra only.' });
+        }
+        if (Number(qualityAssessment?.score || 0) < 45) {
+            return res.status(400).json({ success: false, message: 'Image quality or item condition is too poor. Please upload a clearer and truthful image.' });
+        }
         const spoilAt = category === 'Food' ? calculateSpoilAt(cookedTime, config.freshnessHours) : null;
 
         const newDonation = await Donation.create({
@@ -144,6 +344,11 @@ exports.createDonation = async (req, res) => {
                 extractedText: extractedText || '',
                 isExpired: Boolean(req.body.isExpired)
             },
+            qualityAssessment: {
+                score: Number(qualityAssessment?.score || 0),
+                verdict: qualityAssessment?.verdict || 'pending-review',
+                notes: qualityAssessment?.notes || ''
+            },
             pickupWindowStart: pickupWindowStart || null,
             pickupWindowEnd: pickupWindowEnd || null,
             vehiclePreference: vehiclePreference || '',
@@ -158,7 +363,7 @@ exports.createDonation = async (req, res) => {
 
         const donor = await User.findById(req.user.id);
         if (donor) {
-            donor.impactPoints += 10;
+            donor.impactPoints += 2;
             await donor.save();
         }
 
@@ -189,8 +394,9 @@ exports.createDonation = async (req, res) => {
 exports.getMyActivity = async (req, res) => {
     try {
         const donations = await Donation.find({ donor: req.user.id })
-            .populate('assignedPartner', 'name photo mobile role isVerified')
-            .populate('claimedBy', 'name organizationName')
+            .populate('assignedPartner', 'name photo mobile role isVerified vehicleType availabilityStatus location')
+            .populate('claimedBy', 'name organizationName address location')
+            .populate('matchedRequest', 'title quantityNeeded unit urgency deliveryAddress location')
             .sort({ createdAt: -1 });
 
         donations.forEach(ensureFoodExpiryStatus);
@@ -200,21 +406,45 @@ exports.getMyActivity = async (req, res) => {
         const deliveredDonations = donations.filter((donation) => donation.status === 'Delivered');
         const totalWeight = donations.reduce((acc, curr) => acc + (Number(curr.quantityValue) || 0), 0);
 
-        const rewardCount = Math.floor(deliveredDonations.length / 3);
-        const coupons = [];
-        for (let index = 0; index < rewardCount; index += 1) {
-            coupons.push(`RN-IMPACT-${String(index + 1).padStart(3, '0')}`);
+        const rewards = [];
+        if (deliveredDonations.length >= 1) {
+            rewards.push({
+                title: 'Verified First Delivery',
+                description: 'Your first resource reached a verified NGO with proof-backed delivery.',
+                code: 'RN-FIRST-DELIVERY'
+            });
+        }
+        if (deliveredDonations.length >= 3) {
+            rewards.push({
+                title: 'Impact Reward Coupon',
+                description: 'Unlocked after three successful delivered donations.',
+                code: 'RN-IMPACT-003'
+            });
+        }
+        if (deliveredDonations.length >= 5) {
+            rewards.push({
+                title: 'Silver Donor Badge',
+                description: 'Awarded for consistent fulfilled donations across the network.',
+                code: 'RN-SILVER-DONOR'
+            });
+        }
+        if (deliveredDonations.length >= 10) {
+            rewards.push({
+                title: 'Gold Donor Badge',
+                description: 'Recognizes high-trust community contribution and verified fulfillment.',
+                code: 'RN-GOLD-DONOR'
+            });
         }
 
         res.status(200).json({
             success: true,
-            donations,
+            donations: donations.map((donation) => attachLiveTracking(donation.toObject())),
             stats: {
                 totalDonations: donations.length,
                 livesTouched: deliveredDonations.length,
                 totalImpactUnits: totalWeight,
                 impactPoints: user ? user.impactPoints : 0,
-                rewardsUnlocked: coupons
+                rewardsUnlocked: rewards
             }
         });
     } catch (error) {
@@ -340,6 +570,7 @@ exports.claimDonation = async (req, res) => {
         }).sort({ createdAt: -1 });
 
         if (matchingRequest) {
+            donation.matchedRequest = matchingRequest._id;
             matchingRequest.matchedDonations = Array.from(new Set([
                 ...matchingRequest.matchedDonations.map((item) => String(item)),
                 String(donation._id)
@@ -349,6 +580,7 @@ exports.claimDonation = async (req, res) => {
 
             deliveryRun.ngoRequest = matchingRequest._id;
             await deliveryRun.save();
+            await donation.save();
         }
 
         await logActivity({
@@ -402,11 +634,13 @@ exports.claimDonation = async (req, res) => {
 exports.getMyClaims = async (req, res) => {
     try {
         const donations = await Donation.find({ claimedBy: req.user.id })
-            .populate('donor', 'name mobile')
-            .populate('assignedPartner', 'name mobile photo')
+            .populate('donor', 'name mobile address location')
+            .populate('assignedPartner', 'name mobile photo vehicleType location')
+            .populate('claimedBy', 'name organizationName mobile address location')
+            .populate('matchedRequest', 'title quantityNeeded unit urgency deliveryAddress location')
             .sort({ updatedAt: -1 });
 
-        res.status(200).json({ success: true, data: donations });
+        res.status(200).json({ success: true, data: donations.map((donation) => attachLiveTracking(donation.toObject())) });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
@@ -417,19 +651,22 @@ exports.getDeliveryTasks = async (req, res) => {
         const partner = await User.findById(req.user.id);
         const tasks = await Donation.find({
             $or: [
+                { status: 'Available' },
                 { status: 'Claimed', assignedPartner: null },
                 { assignedPartner: req.user.id, status: { $in: ['Assigned', 'Picked Up', 'In Transit', 'Missed Pickup', 'Rescue Needed'] } }
             ]
         })
             .populate('donor', 'name mobile address')
-            .populate('claimedBy', 'name organizationName mobile address')
+            .populate('claimedBy', 'name organizationName mobile address location')
+            .populate('assignedPartner', 'name mobile photo vehicleType location')
+            .populate('matchedRequest', 'title quantityNeeded unit urgency deliveryAddress location')
             .sort({ updatedAt: -1 });
 
         const partnerAvailableNow = isWithinPartnerSchedule(partner);
 
         res.status(200).json({
             success: true,
-            data: tasks,
+            data: tasks.map((task) => attachLiveTracking(task.toObject())),
             meta: {
                 partnerAvailableNow,
                 availabilityStatus: partner?.availabilityStatus || 'available',
@@ -524,6 +761,14 @@ exports.updateDeliveryStatus = async (req, res) => {
         if (partner && status === 'Delivered') {
             partner.impactPoints += 15;
             await partner.save();
+        }
+
+        if (status === 'Delivered') {
+            const donor = await User.findById(donation.donor);
+            if (donor) {
+                donor.impactPoints += 20;
+                await donor.save();
+            }
         }
 
         await logActivity({
@@ -626,7 +871,8 @@ exports.getPickupDetails = async (req, res) => {
     try {
         const donation = await Donation.findById(req.params.id)
             .populate('donor', 'name mobile email address')
-            .populate('claimedBy', 'name organizationName mobile email address');
+            .populate('claimedBy', 'name organizationName mobile email address location')
+            .populate('matchedRequest', 'title deliveryAddress location');
 
         if (!donation) {
             return res.status(404).json({ message: 'Donation not found' });
@@ -645,7 +891,9 @@ exports.getPickupDetails = async (req, res) => {
             exactCoordinates: donation.location.coordinates,
             exactAddress: donation.location.address,
             donorContact: donation.donor,
-            ngoContact: donation.claimedBy
+            ngoContact: donation.claimedBy,
+            ngoDeliveryAddress: donation.matchedRequest?.deliveryAddress || donation.claimedBy?.address || '',
+            ngoCoordinates: donation.matchedRequest?.location?.coordinates || donation.claimedBy?.location?.coordinates || []
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -661,11 +909,23 @@ exports.createNgoRequest = async (req, res) => {
             unit,
             description,
             urgency,
-            coordinates
+            coordinates,
+            deliveryAddress
         } = req.body;
 
         if (!title || !category) {
             return res.status(400).json({ success: false, message: 'Title and category are required.' });
+        }
+
+        const locationCoordinates = Array.isArray(coordinates) && coordinates.length === 2 ? coordinates : DEFAULT_COORDINATES;
+        if (!isWithinMaharashtra(locationCoordinates)) {
+            return res.status(400).json({ success: false, message: 'NGO request location must be inside Maharashtra.' });
+        }
+
+        const ngoProfile = await User.findById(req.user.id);
+        const resolvedDeliveryAddress = deliveryAddress || ngoProfile?.address || '';
+        if (!looksLikeRealAddress(resolvedDeliveryAddress)) {
+            return res.status(400).json({ success: false, message: 'NGO request must include a valid delivery address.' });
         }
 
         const request = await NGORequest.create({
@@ -676,13 +936,14 @@ exports.createNgoRequest = async (req, res) => {
             unit: unit || 'units',
             description: description || '',
             urgency: urgency || 'Normal',
+            deliveryAddress: resolvedDeliveryAddress,
             location: {
                 type: 'Point',
-                coordinates: Array.isArray(coordinates) && coordinates.length === 2 ? coordinates : DEFAULT_COORDINATES
+                coordinates: locationCoordinates
             }
         });
 
-        const ngo = await User.findById(req.user.id);
+        const ngo = ngoProfile;
         await logActivity({
             recipient: ngo?.email || String(req.user.id),
             trigger: 'NGO Request Created',
@@ -718,7 +979,7 @@ exports.createNgoRequest = async (req, res) => {
 exports.getOpenNgoRequests = async (req, res) => {
     try {
         const requests = await NGORequest.find({ status: 'Open' })
-            .populate('ngo', 'name organizationName city')
+            .populate('ngo', 'name organizationName city address location')
             .sort({ createdAt: -1 });
 
         res.status(200).json({ success: true, data: requests });
@@ -729,8 +990,265 @@ exports.getOpenNgoRequests = async (req, res) => {
 
 exports.getMyNgoRequests = async (req, res) => {
     try {
-        const requests = await NGORequest.find({ ngo: req.user.id }).sort({ createdAt: -1 });
-        res.status(200).json({ success: true, data: requests });
+        const requests = await NGORequest.find({ ngo: req.user.id })
+            .populate({
+                path: 'assignedDonation',
+                populate: [
+                    { path: 'donor', select: 'name mobile address location' },
+                    { path: 'assignedPartner', select: 'name mobile photo vehicleType location' },
+                    { path: 'claimedBy', select: 'name organizationName address location' },
+                    { path: 'matchedRequest', select: 'title quantityNeeded unit urgency deliveryAddress location' }
+                ]
+            })
+            .sort({ createdAt: -1 })
+            .lean();
+
+        const payload = requests.map((request) => ({
+            ...request,
+            assignedDonation: request.assignedDonation ? attachLiveTracking(request.assignedDonation) : null
+        }));
+        res.status(200).json({ success: true, data: payload });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.getAdminRequestMatches = async (req, res) => {
+    try {
+        const config = await getSystemConfig();
+        const requests = await NGORequest.find({ status: { $in: ['Open', 'Matched'] } })
+            .populate('ngo', 'name organizationName city mobile email location address')
+            .sort({ createdAt: -1 })
+            .lean();
+
+        const requestIds = requests.map((item) => item._id);
+        const allOpenDonations = await Donation.find({
+            status: { $in: ['Available', 'Claimed', 'Assigned'] }
+        })
+            .populate('donor', 'name email mobile city address location')
+            .populate('assignedPartner', 'name')
+            .lean();
+
+        const payload = requests.map((request) => {
+            const rankedMatches = allOpenDonations
+                .filter((donation) => donation.category === request.category)
+                .map((donation) => {
+                    const computedDistanceKm = getDistanceKm(request.location?.coordinates || [], donation.location?.coordinates || []);
+                    const distanceKm = deriveAddressDistanceKm(
+                        request.deliveryAddress || request.ngo?.address || '',
+                        donation.location?.address || donation.donor?.address || '',
+                        computedDistanceKm
+                    );
+                    return {
+                        ...donation,
+                        distanceKm,
+                        cityMatch: request.ngo?.city && donation.donor?.city
+                            ? String(request.ngo.city).toLowerCase() === String(donation.donor.city).toLowerCase()
+                            : false,
+                        alreadyLinked: donation.matchedRequest && requestIds.some((id) => String(id) === String(donation.matchedRequest)),
+                        freshnessState: donation.category === 'Food' && donation.spoilAt
+                            ? (new Date(donation.spoilAt) < new Date() ? 'Expired' : 'Fresh')
+                            : (donation.expiryDate || 'Verified')
+                    };
+                })
+                .sort((left, right) => {
+                    if (left.cityMatch !== right.cityMatch) {
+                        return left.cityMatch ? -1 : 1;
+                    }
+                    const distanceA = left.distanceKm ?? Number.MAX_SAFE_INTEGER;
+                    const distanceB = right.distanceKm ?? Number.MAX_SAFE_INTEGER;
+                    return distanceA - distanceB;
+                });
+
+            return {
+                ...request,
+                suggestedDonations: rankedMatches.slice(0, 6)
+            };
+        });
+
+        res.status(200).json({ success: true, data: payload });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.adminAssignDonationToRequest = async (req, res) => {
+    try {
+        const ngoRequest = await NGORequest.findById(req.params.requestId);
+        const donation = await Donation.findById(req.params.donationId);
+
+        if (!ngoRequest || !donation) {
+            return res.status(404).json({ success: false, message: 'Request or donation not found' });
+        }
+
+        if (ngoRequest.status === 'Fulfilled' || ngoRequest.fulfillmentStatus === 'Delivered') {
+            return res.status(400).json({ success: false, message: 'This NGO request is already fulfilled' });
+        }
+
+        if (!['Available', 'Claimed', 'Assigned'].includes(donation.status)) {
+            return res.status(400).json({ success: false, message: 'Donation is not available for orchestration' });
+        }
+
+        if (donation.matchedRequest && String(donation.matchedRequest) !== String(ngoRequest._id)) {
+            return res.status(400).json({ success: false, message: 'Donation is already linked to another NGO request' });
+        }
+
+        const assignment = await buildAssignmentForRequest({
+            req,
+            donation,
+            ngoRequest,
+            actorName: req.user.name,
+            actorId: req.user.id
+        });
+
+        await logActivity({
+            recipient: String(ngoRequest.ngo),
+            trigger: 'Admin Matched Request',
+            message: `${donation.item} matched to ${ngoRequest.title}`,
+            metadata: { requestId: ngoRequest._id, donationId: donation._id, adminId: req.user.id }
+        });
+
+        res.status(200).json({
+            success: true,
+            data: donation,
+            request: ngoRequest,
+            ...assignment
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.updateNgoRequest = async (req, res) => {
+    try {
+        const request = await NGORequest.findById(req.params.id);
+        if (!request) {
+            return res.status(404).json({ success: false, message: 'NGO request not found' });
+        }
+
+        const role = normalizeRole(req.user.role);
+        const ownsRequest = String(request.ngo) === req.user.id;
+        if (!(role === 'admin' || (role === 'ngo' && ownsRequest))) {
+            return res.status(403).json({ success: false, message: 'You cannot edit this request' });
+        }
+
+        const updates = {
+            title: req.body.title,
+            category: req.body.category,
+            quantityNeeded: req.body.quantityNeeded !== undefined ? Number(req.body.quantityNeeded) : undefined,
+            unit: req.body.unit,
+            description: req.body.description,
+            urgency: req.body.urgency,
+            neededBy: req.body.neededBy || undefined,
+            adminNotes: req.body.adminNotes,
+            adminReviewStatus: req.body.adminReviewStatus
+        };
+
+        Object.keys(updates).forEach((key) => updates[key] === undefined && delete updates[key]);
+        Object.assign(request, updates);
+        await request.save();
+
+        res.status(200).json({ success: true, data: request });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.deleteNgoRequest = async (req, res) => {
+    try {
+        const request = await NGORequest.findById(req.params.id);
+        if (!request) {
+            return res.status(404).json({ success: false, message: 'NGO request not found' });
+        }
+
+        const role = normalizeRole(req.user.role);
+        const ownsRequest = String(request.ngo) === req.user.id;
+        if (!(role === 'admin' || (role === 'ngo' && ownsRequest))) {
+            return res.status(403).json({ success: false, message: 'You cannot delete this request' });
+        }
+
+        await NGORequest.findByIdAndDelete(req.params.id);
+        res.status(200).json({ success: true, message: 'Request deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.updateDonation = async (req, res) => {
+    try {
+        const donation = await Donation.findById(req.params.id);
+        if (!donation) {
+            return res.status(404).json({ success: false, message: 'Donation not found' });
+        }
+
+        const role = normalizeRole(req.user.role);
+        const ownsDonation = String(donation.donor) === req.user.id;
+        if (!(role === 'admin' || (role === 'donor' && ownsDonation))) {
+            return res.status(403).json({ success: false, message: 'You cannot edit this donation' });
+        }
+
+        const restrictedStatuses = ['Picked Up', 'In Transit', 'Delivered'];
+        if (restrictedStatuses.includes(donation.status) && role !== 'admin') {
+            return res.status(400).json({ success: false, message: 'Donation cannot be edited after delivery operations begin' });
+        }
+
+        const updates = {
+            item: req.body.item,
+            description: req.body.description,
+            quantityValue: req.body.quantityValue !== undefined ? Number(req.body.quantityValue) : undefined,
+            unit: req.body.unit,
+            cookedTime: req.body.cookedTime,
+            expiryDate: req.body.expiryDate,
+            batchNumber: req.body.batchNumber,
+            pickupWindowStart: req.body.pickupWindowStart || undefined,
+            pickupWindowEnd: req.body.pickupWindowEnd || undefined,
+            vehiclePreference: req.body.vehiclePreference,
+            cancellationReason: req.body.cancellationReason
+        };
+
+        if (req.body.address) {
+            updates.publicAddressHint = `${String(req.body.address).split(',')[0]}, area hidden until assignment`;
+            donation.location.address = req.body.address;
+        }
+
+        if (Array.isArray(req.body.coordinates) && req.body.coordinates.length === 2) {
+            donation.location.coordinates = req.body.coordinates;
+        }
+
+        if (updates.cookedTime) {
+            const config = await getSystemConfig();
+            donation.spoilAt = calculateSpoilAt(updates.cookedTime, config.freshnessHours);
+        }
+
+        Object.keys(updates).forEach((key) => updates[key] === undefined && delete updates[key]);
+        Object.assign(donation, updates);
+        await donation.save();
+
+        res.status(200).json({ success: true, data: donation });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.deleteDonation = async (req, res) => {
+    try {
+        const donation = await Donation.findById(req.params.id);
+        if (!donation) {
+            return res.status(404).json({ success: false, message: 'Donation not found' });
+        }
+
+        const role = normalizeRole(req.user.role);
+        const ownsDonation = String(donation.donor) === req.user.id;
+        if (!(role === 'admin' || (role === 'donor' && ownsDonation))) {
+            return res.status(403).json({ success: false, message: 'You cannot delete this donation' });
+        }
+
+        if (!['Available', 'Expired', 'Cancelled'].includes(donation.status) && role !== 'admin') {
+            return res.status(400).json({ success: false, message: 'Only open, expired, or cancelled donations can be removed by donors' });
+        }
+
+        await Donation.findByIdAndDelete(req.params.id);
+        res.status(200).json({ success: true, message: 'Donation deleted successfully' });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }

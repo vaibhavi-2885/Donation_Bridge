@@ -15,7 +15,7 @@ const createNotification = async (req, payload = {}) => {
     const notifications = await Notification.insertMany(
       users.map((userId) => ({
         user: userId,
-        title: payload.title || 'Resource Network Update',
+        title: payload.title || 'Donation Bridge Update',
         message: payload.message || '',
         type: payload.type || 'system',
         severity: payload.severity || 'info',
@@ -43,8 +43,8 @@ const createNotification = async (req, payload = {}) => {
           try {
             await sendEmail({
               email: user.email,
-              subject: payload.title || 'Resource Network Notification',
-              message: payload.message || 'A new notification is available in Resource Network.'
+              subject: payload.title || 'Donation Bridge Notification',
+              message: payload.message || 'A new notification is available in Donation Bridge.'
             });
           } catch (error) {
             await logActivity({

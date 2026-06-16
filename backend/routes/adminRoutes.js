@@ -371,13 +371,53 @@ router.get('/expiry-monitor', async (req, res) => {
 router.get('/delivery-runs', async (req, res) => {
     try {
         const runs = await DeliveryRun.find()
-            .populate('donation', 'item category status')
+            .populate({
+                path: 'donation',
+                select: 'item category status location matchedRequest claimedBy assignedPartner',
+                populate: [
+                    { path: 'matchedRequest', select: 'title deliveryAddress location' },
+                    { path: 'claimedBy', select: 'name organizationName address location' },
+                    { path: 'assignedPartner', select: 'name mobile vehicleType location' }
+                ]
+            })
             .populate('donor', 'name')
-            .populate('ngo', 'name organizationName')
-            .populate('partner', 'name vehicleType')
+            .populate('ngo', 'name organizationName address')
+            .populate('partner', 'name vehicleType mobile availabilityStatus location')
             .sort({ createdAt: -1 });
 
-        res.status(200).json(runs);
+        const payload = runs.map((run) => {
+            const donation = run.donation?.toObject ? run.donation.toObject() : run.donation;
+            const pickupCoordinates = donation?.location?.coordinates || [];
+            const dropCoordinates = donation?.matchedRequest?.location?.coordinates ||
+                donation?.claimedBy?.location?.coordinates || [];
+            const progress = donation?.status === 'Assigned' ? 0.12 :
+                donation?.status === 'Picked Up' ? 0.35 :
+                    donation?.status === 'In Transit' ? 0.7 :
+                        donation?.status === 'Delivered' ? 1 : 0;
+            const currentCoordinates =
+                pickupCoordinates.length === 2 && dropCoordinates.length === 2
+                    ? [
+                        Number((pickupCoordinates[0] + (dropCoordinates[0] - pickupCoordinates[0]) * progress).toFixed(6)),
+                        Number((pickupCoordinates[1] + (dropCoordinates[1] - pickupCoordinates[1]) * progress).toFixed(6))
+                    ]
+                    : [];
+
+            return {
+                ...run.toObject(),
+                donation: donation ? {
+                    ...donation,
+                    liveTracking: {
+                        progress,
+                        pickupCoordinates,
+                        dropCoordinates,
+                        currentCoordinates,
+                        deliveryAddress: donation?.matchedRequest?.deliveryAddress || donation?.claimedBy?.address || ''
+                    }
+                } : donation
+            };
+        });
+
+        res.status(200).json(payload);
     } catch (error) {
         res.status(500).json({ message: 'Failed to fetch delivery runs', error: error.message });
     }
