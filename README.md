@@ -223,7 +223,7 @@ This project is licensed under the ISC License - see the `package.json` file for
 
 ## 👤 Author
 
-**Vaibhavi Sharma** (@vaibhavi-2885)
+**Vaibhavi Mahajan** (@vaibhavi-2885)
 
 ---
 
